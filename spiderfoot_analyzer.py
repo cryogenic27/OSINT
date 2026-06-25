@@ -3,15 +3,15 @@
 SpiderFoot OSINT Report Generator — v2 (Premium UI)
 Generates an HTML report from SpiderFoot CSV export.
 Analysis framed around F3EAD, JTC, and MITRE ATT&CK.
-
+ 
 Usage: python3 generate_spiderfoot_report_v2.py <input.csv> [output.html]
 """
-
+ 
 import sys
 import json
 import pandas as pd
 from pathlib import Path
-
+ 
 # ── MITRE ATT&CK mappings ─────────────────────────────────────────────────────
 MITRE_MAP = {
     "TCP_PORT_OPEN":              {"id": "T1046",    "name": "Network Service Discovery",              "tactic": "Discovery"},
@@ -41,7 +41,7 @@ MITRE_MAP = {
     "WEBSERVER_STRANGEHEADER":    {"id": "T1592",    "name": "Gather Victim Host Information",         "tactic": "Reconnaissance"},
     "PHYSICAL_ADDRESS":           {"id": "T1591",    "name": "Gather Victim Org Information",          "tactic": "Reconnaissance"},
 }
-
+ 
 # ── F3EAD phase mappings ───────────────────────────────────────────────────────
 F3EAD_MAP = {
     "FIND": [
@@ -77,7 +77,7 @@ F3EAD_MAP = {
         "AFFILIATE_DESCRIPTION_ABSTRACT",
     ],
 }
-
+ 
 # ── JTC phase mappings ─────────────────────────────────────────────────────────
 JTC_MAP = {
     "Target Development": [
@@ -102,9 +102,12 @@ JTC_MAP = {
         "ACCOUNT_EXTERNAL_OWNED","PUBLIC_CODE_REPO","SOCIAL_MEDIA",
     ],
 }
-
+ 
+# Default severity for an open bucket when NO sensitive data is detected.
+# Open buckets are common; we only escalate to CRITICAL when the bucket
+# actually exposes sensitive/confidential content (see SENSITIVE_KEYWORDS).
 SEVERITY_MAP = {
-    "CLOUD_STORAGE_BUCKET_OPEN": "CRITICAL",
+    "CLOUD_STORAGE_BUCKET_OPEN": "HIGH",
     "URL_UPLOAD":                "CRITICAL",
     "URL_PASSWORD":              "HIGH",
     "INTERESTING_FILE":          "HIGH",
@@ -123,54 +126,166 @@ SEVERITY_MAP = {
     "PGP_KEY":                   "LOW",
     "AFFILIATE_EMAILADDR":       "LOW",
 }
-
+ 
+# ── Port exemptions ───────────────────────────────────────────────────────────
+# Open TCP ports listed here are treated as expected/normal and are NOT counted
+# toward severity (they are downgraded to "INFO"). Add or remove ports as your
+# environment's baseline requires. Example: 443 = HTTPS, 80 = HTTP.
+EXEMPT_PORTS = {
+    443,   # HTTPS
+    # 80,  # HTTP  (uncomment to also exempt plain HTTP)
+}
+ 
+# Keywords that indicate sensitive / confidential content. If an open bucket's
+# contents or name match any of these, it is escalated to CRITICAL. Otherwise an
+# open-but-non-sensitive bucket stays HIGH (publicly readable, but no confirmed
+# sensitive data exposed).
+SENSITIVE_KEYWORDS = [
+    "secret", "secrets", "password", "passwd", "credential", "cred",
+    "private", "confidential", "internal", "backup", "dump", "key", "keys",
+    "token", "apikey", "api_key", ".env", "config", "configuration",
+    "ssh", "rsa", "pem", ".pfx", ".p12", "keystore", "vault",
+    "financ", "salary", "payroll", "invoice", "tax", "ssn", "passport",
+    "contract", "nda", "legal", "hr", "employee", "personnel", "pii",
+    "database", "db_", "dbdump", ".sql", ".bak", "firewall", "vpn",
+    "business_plan", "businessplan", "acquisition", "merger", "patient",
+    "medical", "health", "customer", "client_data", "user_data",
+]
+ 
+def classify_bucket_severity(bucket_source, related_files):
+    """
+    Decide an open bucket's severity.
+    - CRITICAL: bucket name OR any file under it matches a sensitive keyword.
+    - HIGH:     bucket is open but no sensitive content is confirmed.
+    Returns (severity, matched_keywords).
+    """
+    haystack = bucket_source.lower()
+    for f in related_files:
+        haystack += " " + str(f).lower()
+    matched = sorted({kw for kw in SENSITIVE_KEYWORDS if kw in haystack})
+    if matched:
+        return "CRITICAL", matched
+    return "HIGH", []
+ 
+def port_from_finding(data_value):
+    """
+    Pull the port number out of a TCP_PORT_OPEN value like
+    'host:443' or '1.2.3.4:8080'. Returns an int, or None if not parseable.
+    """
+    try:
+        return int(str(data_value).strip().split(":")[-1])
+    except (ValueError, IndexError):
+        return None
+ 
 def load_data(csv_path):
     return pd.read_csv(csv_path)
-
+ 
 def build_json_payload(df):
     def get(type_name, cols=None):
         sub = df[df['Type'] == type_name].drop_duplicates(subset=['Data'])
         if cols:
             return sub[cols].values.tolist()
         return sub['Data'].tolist()
-
+ 
     def get_multi(type_names, cols=None):
         sub = df[df['Type'].isin(type_names)].drop_duplicates(subset=['Type','Data'])
         if cols:
             return sub[cols].values.tolist()
         return sub[['Type','Data']].values.tolist()
-
+ 
     type_counts = df['Type'].value_counts().to_dict()
-
+ 
+    # ── Per-bucket severity classification ───────────────────────────────────
+    # An open bucket is CRITICAL only when it exposes sensitive content;
+    # otherwise it is HIGH. We inspect the bucket name plus any INTERESTING_FILE
+    # URLs that reference the same bucket host.
+    raw_buckets = get("CLOUD_STORAGE_BUCKET_OPEN", ["Source", "Data"])
+    all_file_urls = (
+        get("INTERESTING_FILE")
+        + get("INTERESTING_FILE_HISTORIC")
+        + [r[1] for r in get("URL_UPLOAD", ["Source", "Data"])]
+    )
+    bucket_records = []
+    bucket_crit_count = 0
+    bucket_high_count = 0
+    for src, data in raw_buckets:
+        # Bucket host without scheme, e.g. "pentest-ground-bucket.s3.amazonaws.com"
+        host = str(src).replace("https://", "").replace("http://", "").split("/")[0].lower()
+        # Only associate files that are actually served FROM this bucket host.
+        # (SpiderFoot web-directory files live on the main site, not the bucket,
+        #  so we must match the full bucket host to avoid false escalation.)
+        related = [u for u in all_file_urls if host and host in str(u).lower()]
+        sev_level, matched = classify_bucket_severity(str(src) + " " + str(data), related)
+        if sev_level == "CRITICAL":
+            bucket_crit_count += 1
+        else:
+            bucket_high_count += 1
+        bucket_records.append({
+            "source": src,
+            "data": data,
+            "severity": sev_level,
+            "matched": matched,
+        })
+ 
+    # ── Per-port severity for open TCP ports ─────────────────────────────────
+    # Each open port is HIGH, EXCEPT ports in EXEMPT_PORTS (e.g. 443/HTTPS),
+    # which are downgraded to INFO and excluded from the HIGH total.
+    raw_ports = get("TCP_PORT_OPEN", ["Source", "Data"])
+    port_high_count = 0
+    port_exempt_count = 0
+    for _src, pdata in raw_ports:
+        if port_from_finding(pdata) in EXEMPT_PORTS:
+            port_exempt_count += 1
+        else:
+            port_high_count += 1
+ 
     sev = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for t, s in SEVERITY_MAP.items():
+        # Buckets and TCP ports are counted separately below (per-item logic).
+        if t in ("CLOUD_STORAGE_BUCKET_OPEN", "TCP_PORT_OPEN"):
+            continue
         sev[s] = sev.get(s, 0) + type_counts.get(t, 0)
-
+    sev["CRITICAL"] += bucket_crit_count
+    sev["HIGH"] += bucket_high_count
+    sev["HIGH"] += port_high_count
+    sev["INFO"] += port_exempt_count
+ 
     f3ead_counts = {phase: sum(type_counts.get(t, 0) for t in types) for phase, types in F3EAD_MAP.items()}
     jtc_counts   = {phase: sum(type_counts.get(t, 0) for t in types) for phase, types in JTC_MAP.items()}
-
+ 
     tactic_counts = {}
     for t, info in MITRE_MAP.items():
         tactic = info['tactic']
         tactic_counts[tactic] = tactic_counts.get(tactic, 0) + type_counts.get(t, 0)
-
+ 
     findings = []
     for t, mitre in MITRE_MAP.items():
         cnt = type_counts.get(t, 0)
         if cnt > 0:
+            if t == "CLOUD_STORAGE_BUCKET_OPEN":
+                # Use the highest severity observed across individual buckets.
+                fsev = "CRITICAL" if bucket_crit_count > 0 else "HIGH"
+            elif t == "TCP_PORT_OPEN":
+                # Only non-exempt ports carry severity; show that count instead.
+                cnt = port_high_count
+                fsev = SEVERITY_MAP.get(t, "INFO")
+                if cnt == 0:
+                    continue  # every open port was exempt — drop the row
+            else:
+                fsev = SEVERITY_MAP.get(t, "INFO")
             findings.append({
                 "type": t,
                 "count": cnt,
-                "severity": SEVERITY_MAP.get(t, "INFO"),
+                "severity": fsev,
                 "mitre_id": mitre["id"],
                 "mitre_name": mitre["name"],
                 "tactic": mitre["tactic"],
                 "url": f"https://attack.mitre.org/techniques/{mitre['id'].replace('.', '/')}",
             })
     findings.sort(key=lambda x: ["CRITICAL","HIGH","MEDIUM","LOW","INFO"].index(x["severity"]))
-
+ 
     exposures = {
-        "cloud_buckets": [{"source": r[0], "data": r[1]} for r in get("CLOUD_STORAGE_BUCKET_OPEN", ["Source","Data"])],
+        "cloud_buckets": bucket_records,
         "interesting_files": get("INTERESTING_FILE"),
         "interesting_files_historic": get("INTERESTING_FILE_HISTORIC"),
         "tcp_ports": [{"source": r[0], "data": r[1]} for r in get("TCP_PORT_OPEN", ["Source","Data"])],
@@ -196,10 +311,10 @@ def build_json_payload(df):
             x in e.lower() for x in ['abuse','privacy','protect','gdpr','masking','withheld','registrar']
         )][:25],
     }
-
+ 
     scan_name = df['Scan Name'].iloc[0] if len(df) > 0 else "Unknown"
     scan_date = df['Updated'].max() if 'Updated' in df.columns else "Unknown"
-
+ 
     return {
         "scan_name": scan_name,
         "scan_date": str(scan_date),
@@ -213,8 +328,9 @@ def build_json_payload(df):
         "exposures": exposures,
         "f3ead_map": F3EAD_MAP,
         "jtc_map": JTC_MAP,
+        "exempt_ports": sorted(EXEMPT_PORTS),
     }
-
+ 
 # ═════════════════════════════════════════════════════════════════════════════
 # HTML TEMPLATE — Premium UI v2
 # ═════════════════════════════════════════════════════════════════════════════
@@ -231,27 +347,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 /* ── Reset & Tokens ─────────────────────────────────────────────────────── */
 *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
 :root{{
-  --bg:        #0B0F19;
-  --surface:   #111827;
-  --surface2:  #161D2E;
-  --surface3:  #1E2A3E;
+  --bg:        #141924;
+  --surface:   #1C2537;
+  --surface2:  #212D42;
+  --surface3:  #283550;
   --border:    rgba(255,255,255,0.07);
   --border2:   rgba(255,255,255,0.12);
-
+ 
   --text:      #E2E8F0;
   --text2:     #8B9DB5;
   --text3:     #556070;
   --mono:      'JetBrains Mono', 'Consolas', monospace;
-
+ 
   --accent:    #4F8EF7;
   --accent-glow: rgba(79,142,247,0.15);
-
+ 
   --c-critical: #DC2626;
   --c-high:     #EA580C;
   --c-medium:   #D97706;
   --c-low:      #059669;
   --c-info:     #4F8EF7;
-
+ 
   --radius:    10px;
   --radius-sm: 6px;
 }}
@@ -264,15 +380,15 @@ body{{
   line-height:1.6;
   -webkit-font-smoothing:antialiased;
 }}
-
+ 
 /* ── Scrollbar ──────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar{{width:5px;height:5px}}
 ::-webkit-scrollbar-track{{background:var(--surface)}}
 ::-webkit-scrollbar-thumb{{background:var(--surface3);border-radius:99px}}
-
+ 
 /* ── Layout ─────────────────────────────────────────────────────────────── */
 .app{{display:flex;min-height:100vh}}
-
+ 
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */
 .sidebar{{
   width:220px;flex-shrink:0;
@@ -328,12 +444,12 @@ body{{
 }}
 .nav-icon{{width:16px;text-align:center;opacity:.7;font-size:13px}}
 .nav-item.active .nav-icon{{opacity:1}}
-
+ 
 /* ── Main content ────────────────────────────────────────────────────────── */
 .main{{margin-left:220px;flex:1;min-height:100vh}}
 .tab-panel{{display:none;padding:32px 36px;max-width:1320px}}
 .tab-panel.active{{display:block}}
-
+ 
 /* ── Page header ─────────────────────────────────────────────────────────── */
 .page-hdr{{margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border)}}
 .page-hdr h1{{
@@ -342,7 +458,7 @@ body{{
 }}
 .page-hdr p{{font-size:12px;color:var(--text3)}}
 .page-hdr .badge-row{{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}}
-
+ 
 /* ── Metric cards ────────────────────────────────────────────────────────── */
 .metric-grid{{
   display:grid;
@@ -374,7 +490,7 @@ body{{
 .metric-card.medium .metric-value{{color:var(--c-medium)}}
 .metric-card.low .metric-value{{color:var(--c-low)}}
 .metric-label{{font-size:10.5px;font-weight:600;letter-spacing:.8px;text-transform:uppercase;color:var(--text3)}}
-
+ 
 /* ── Chart cards ─────────────────────────────────────────────────────────── */
 .chart-grid{{display:grid;gap:16px;grid-template-columns:1fr 1fr;margin-bottom:24px}}
 .chart-card{{
@@ -388,7 +504,7 @@ body{{
   text-transform:uppercase;color:var(--text2);
 }}
 .chart-wrap{{position:relative}}
-
+ 
 /* ── Section headers ─────────────────────────────────────────────────────── */
 .sec-hdr{{
   display:flex;align-items:center;gap:10px;
@@ -402,7 +518,7 @@ body{{
   border-radius:99px;background:var(--surface3);color:var(--text3);
   border:1px solid var(--border);
 }}
-
+ 
 /* ── Alert banner ────────────────────────────────────────────────────────── */
 .alert-banner{{
   border-radius:var(--radius-sm);
@@ -417,7 +533,7 @@ body{{
 .alert-critical .alert-body strong{{color:var(--c-critical)}}
 .alert-high{{background:rgba(234,88,12,.07);border-color:var(--c-high)}}
 .alert-high .alert-body strong{{color:var(--c-high)}}
-
+ 
 /* ── Data table ──────────────────────────────────────────────────────────── */
 .data-table-wrap{{
   border:1px solid var(--border);border-radius:var(--radius);
@@ -440,7 +556,7 @@ td{{
 tbody tr:last-child td{{border-bottom:none}}
 tbody tr:nth-child(even){{background:rgba(255,255,255,.018)}}
 tbody tr:hover td{{background:rgba(79,142,247,.06);transition:background .1s}}
-
+ 
 /* url cells */
 .url-val{{
   font-family:var(--mono);font-size:11.5px;color:#7EB3FF;
@@ -449,10 +565,23 @@ tbody tr:hover td{{background:rgba(79,142,247,.06);transition:background .1s}}
 }}
 .url-val:hover{{white-space:normal;word-break:break-all}}
 .mono-val{{font-family:var(--mono);font-size:11.5px}}
-
+ 
+/* repo URL cell: keep on one line, ellipsis, never wrap (so copy stays put) */
+.repo-url-cell{{max-width:380px}}
+.repo-url{{
+  display:inline-block;max-width:360px;vertical-align:middle;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  text-decoration:none;
+}}
+.repo-url:hover{{white-space:nowrap;text-decoration:underline}}
+/* fixed copy cell: narrow, button always visible, right aligned */
+.copy-cell{{width:36px;text-align:center;white-space:nowrap}}
+.copy-cell .copy-btn{{opacity:.55}}
+tr:hover .copy-cell .copy-btn{{opacity:1}}
+ 
 /* null/undefined display */
 .null-val{{color:var(--text3);font-style:italic;font-size:11px}}
-
+ 
 /* copy button */
 .copy-btn{{
   background:none;border:none;cursor:pointer;
@@ -462,7 +591,7 @@ tbody tr:hover td{{background:rgba(79,142,247,.06);transition:background .1s}}
 }}
 tr:hover .copy-btn{{opacity:1}}
 .copy-btn:hover{{color:var(--accent);background:var(--accent-glow)}}
-
+ 
 /* ── Severity badges ─────────────────────────────────────────────────────── */
 .sev{{
   display:inline-flex;align-items:center;gap:4px;
@@ -481,7 +610,7 @@ tr:hover .copy-btn{{opacity:1}}
 .sev-LOW::before{{background:var(--c-low)}}
 .sev-INFO{{background:rgba(79,142,247,.12);color:var(--c-info);border:1px solid rgba(79,142,247,.25)}}
 .sev-INFO::before{{background:var(--c-info)}}
-
+ 
 /* ── MITRE badge ─────────────────────────────────────────────────────────── */
 .mitre-tag{{
   display:inline-block;font-family:var(--mono);
@@ -492,7 +621,7 @@ tr:hover .copy-btn{{opacity:1}}
   transition:background .15s;
 }}
 .mitre-tag:hover{{background:rgba(79,142,247,.2)}}
-
+ 
 /* tactic */
 .tactic-tag{{
   display:inline-block;font-size:10px;font-weight:500;
@@ -500,19 +629,19 @@ tr:hover .copy-btn{{opacity:1}}
   background:rgba(139,157,181,.08);color:var(--text2);
   border:1px solid var(--border2);
 }}
-
+ 
 /* ── Category chips ──────────────────────────────────────────────────────── */
 .chip{{
   display:inline-block;font-size:10px;font-weight:600;
   padding:2px 8px;border-radius:99px;
   background:var(--surface3);color:var(--text3);border:1px solid var(--border);
 }}
-
+ 
 /* ── Provider badges ─────────────────────────────────────────────────────── */
 .prov-aws{{background:rgba(255,153,0,.1);color:#FFAD33;border:1px solid rgba(255,153,0,.25)}}
 .prov-gcp{{background:rgba(66,133,244,.1);color:#7EB3FF;border:1px solid rgba(66,133,244,.25)}}
 .prov-cloud{{background:var(--surface3);color:var(--text2);border:1px solid var(--border)}}
-
+ 
 /* ── Search bar ──────────────────────────────────────────────────────────── */
 .search-bar{{
   display:flex;align-items:center;gap:8px;
@@ -527,7 +656,7 @@ tr:hover .copy-btn{{opacity:1}}
   font-family:'Inter',sans-serif;
 }}
 .search-bar input::placeholder{{color:var(--text3)}}
-
+ 
 /* ── Phase cards (F3EAD) ─────────────────────────────────────────────────── */
 .phase-grid{{display:grid;gap:14px;grid-template-columns:repeat(3,1fr);margin-bottom:24px}}
 .phase-card{{
@@ -555,7 +684,7 @@ tr:hover .copy-btn{{opacity:1}}
 .phase-item:last-child{{border-bottom:none}}
 .phase-item-name{{color:var(--text2);font-family:var(--mono);font-size:10.5px}}
 .phase-item-cnt{{font-weight:600;font-size:11px}}
-
+ 
 /* ── JTC pipeline ────────────────────────────────────────────────────────── */
 .jtc-pipeline{{
   display:flex;gap:0;margin-bottom:24px;
@@ -569,7 +698,7 @@ tr:hover .copy-btn{{opacity:1}}
 .jtc-stage:last-child{{border-right:none}}
 .jtc-stage-name{{font-size:9.5px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:var(--text3);margin-bottom:4px}}
 .jtc-stage-count{{font-size:22px;font-weight:700}}
-
+ 
 /* ── PGP viewer ──────────────────────────────────────────────────────────── */
 .pgp-block{{
   background:#0D1117;border:1px solid var(--border);
@@ -586,7 +715,7 @@ tr:hover .copy-btn{{opacity:1}}
   color:#8FB3D3;line-height:1.7;overflow-x:auto;
   max-height:180px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;
 }}
-
+ 
 /* ── Overview alerts list ────────────────────────────────────────────────── */
 .alert-row{{
   display:flex;align-items:center;gap:12px;
@@ -604,7 +733,7 @@ tr:hover .copy-btn{{opacity:1}}
   font-size:11px;font-weight:700;color:var(--text2);
   background:var(--surface3);padding:2px 8px;border-radius:99px;
 }}
-
+ 
 /* ── Multi-col grid (identity) ───────────────────────────────────────────── */
 .two-col{{display:grid;gap:16px;grid-template-columns:1fr 1fr}}
 .name-grid{{
@@ -618,7 +747,7 @@ tr:hover .copy-btn{{opacity:1}}
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }}
 .name-chip.mono-chip{{font-family:var(--mono);font-size:11px}}
-
+ 
 /* ── Subdomain / infra chips ─────────────────────────────────────────────── */
 .host-grid{{
   display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
@@ -630,7 +759,7 @@ tr:hover .copy-btn{{opacity:1}}
   font-family:var(--mono);font-size:11px;color:#7EB3FF;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
 }}
-
+ 
 /* ── Status bar (bottom) ─────────────────────────────────────────────────── */
 .status-bar{{
   position:fixed;bottom:0;left:220px;right:0;
@@ -639,7 +768,7 @@ tr:hover .copy-btn{{opacity:1}}
   display:flex;align-items:center;gap:16px;z-index:100;
 }}
 .status-bar .sb-dot{{width:6px;height:6px;border-radius:50%;background:var(--c-low);box-shadow:0 0 5px var(--c-low)}}
-
+ 
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 @media(max-width:1100px){{
   .metric-grid{{grid-template-columns:repeat(3,1fr)}}
@@ -661,7 +790,7 @@ tr:hover .copy-btn{{opacity:1}}
 </head>
 <body>
 <div class="app">
-
+ 
 <!-- ═══════════════════════════════════════════════════
      SIDEBAR
 ═══════════════════════════════════════════════════════ -->
@@ -701,17 +830,17 @@ tr:hover .copy-btn{{opacity:1}}
     </button>
   </nav>
 </aside>
-
+ 
 <!-- ═══════════════════════════════════════════════════
      DATA
 ═══════════════════════════════════════════════════════ -->
 <script>const DATA={data_json};</script>
-
+ 
 <!-- ═══════════════════════════════════════════════════
      MAIN CONTENT
 ═══════════════════════════════════════════════════════ -->
 <main class="main">
-
+ 
 <!-- TAB: OVERVIEW -->
 <div id="tab-overview" class="tab-panel active">
   <div class="page-hdr">
@@ -732,7 +861,7 @@ tr:hover .copy-btn{{opacity:1}}
   <div class="sec-hdr"><h2>Critical &amp; High Priority Findings</h2></div>
   <div id="critical-alerts"></div>
 </div>
-
+ 
 <!-- TAB: EXPOSURES -->
 <div id="tab-exposures" class="tab-panel">
   <div class="page-hdr">
@@ -741,7 +870,7 @@ tr:hover .copy-btn{{opacity:1}}
   </div>
   <div id="exposures-content"></div>
 </div>
-
+ 
 <!-- TAB: F3EAD -->
 <div id="tab-f3ead" class="tab-panel">
   <div class="page-hdr">
@@ -760,7 +889,7 @@ tr:hover .copy-btn{{opacity:1}}
   </div>
   <div class="phase-grid" id="f3ead-phases"></div>
 </div>
-
+ 
 <!-- TAB: JTC -->
 <div id="tab-jtc" class="tab-panel">
   <div class="page-hdr">
@@ -776,7 +905,7 @@ tr:hover .copy-btn{{opacity:1}}
   <div class="jtc-pipeline" id="jtc-pipeline"></div>
   <div id="jtc-phases"></div>
 </div>
-
+ 
 <!-- TAB: MITRE -->
 <div id="tab-mitre" class="tab-panel">
   <div class="page-hdr">
@@ -803,7 +932,7 @@ tr:hover .copy-btn{{opacity:1}}
     </table>
   </div>
 </div>
-
+ 
 <!-- TAB: IDENTITY -->
 <div id="tab-identity" class="tab-panel">
   <div class="page-hdr">
@@ -812,7 +941,7 @@ tr:hover .copy-btn{{opacity:1}}
   </div>
   <div id="identity-content"></div>
 </div>
-
+ 
 <!-- TAB: INFRA -->
 <div id="tab-infra" class="tab-panel">
   <div class="page-hdr">
@@ -821,9 +950,9 @@ tr:hover .copy-btn{{opacity:1}}
   </div>
   <div id="infra-content"></div>
 </div>
-
+ 
 </main><!-- /main -->
-
+ 
 <!-- STATUS BAR -->
 <div class="status-bar">
   <span class="sb-dot"></span>
@@ -831,9 +960,9 @@ tr:hover .copy-btn{{opacity:1}}
   <span style="color:var(--border2)">|</span>
   <span id="sb-status">Loaded</span>
 </div>
-
+ 
 </div><!-- /app -->
-
+ 
 <!-- ═══════════════════════════════════════════════════
      JAVASCRIPT
 ═══════════════════════════════════════════════════════ -->
@@ -864,14 +993,14 @@ function tbl(headers,rows){{
   const ths=headers.map(h=>`<th>${{h}}</th>`).join('');
   return`<div class="data-table-wrap"><table><thead><tr>${{ths}}</tr></thead><tbody>${{rows}}</tbody></table></div>`;
 }}
-
+ 
 /* ── Sidebar meta ────────────────────────────────────────────────────────── */
 document.getElementById('sb-target').textContent=DATA.scan_name;
 document.getElementById('sb-date').textContent=DATA.scan_date.slice(0,10);
 document.getElementById('sb-records').textContent=DATA.total_findings.toLocaleString();
 document.getElementById('sb-status').textContent=
   `${{DATA.total_findings.toLocaleString()}} records · ${{DATA.severity.CRITICAL||0}} critical`;
-
+ 
 /* ── Overview: metric cards ──────────────────────────────────────────────── */
 const sevDefs=[
   {{cls:'total', icon:'⬡', label:'Total Records', val:DATA.total_findings}},
@@ -888,7 +1017,7 @@ sevDefs.forEach(d=>{{
     <div class="metric-label">${{d.label}}</div>
   </div>`;
 }});
-
+ 
 /* ── Overview: critical alert rows ──────────────────────────────────────── */
 const critEl=document.getElementById('critical-alerts');
 DATA.findings.filter(f=>f.severity==='CRITICAL'||f.severity==='HIGH').forEach(f=>{{
@@ -902,15 +1031,15 @@ DATA.findings.filter(f=>f.severity==='CRITICAL'||f.severity==='HIGH').forEach(f=
     </div>
   </div>`;
 }});
-
+ 
 /* Chart defaults */
 Chart.defaults.color='#8B9DB5';
 Chart.defaults.font.family='Inter,system-ui,sans-serif';
 Chart.defaults.font.size=11;
-
-const GRID_COLOR='rgba(255,255,255,0.05)';
+ 
+const GRID_COLOR='rgba(255,255,255,0.09)';
 const SEV_COLORS=['#DC2626','#EA580C','#D97706','#059669'];
-
+ 
 /* ── Chart: Severity Donut ───────────────────────────────────────────────── */
 const sevLabels=['CRITICAL','HIGH','MEDIUM','LOW'];
 const sevData=sevLabels.map(s=>DATA.severity[s]||0);
@@ -919,7 +1048,7 @@ new Chart(document.getElementById('chartSev'),{{
   type:'doughnut',
   data:{{labels:sevLabels,datasets:[{{
     data:sevData,
-    backgroundColor:SEV_COLORS.map(c=>c+'22'),
+    backgroundColor:SEV_COLORS,
     borderColor:SEV_COLORS,borderWidth:2,hoverOffset:4
   }}]}},
   options:{{
@@ -945,7 +1074,7 @@ new Chart(document.getElementById('chartSev'),{{
     }}
   }}]
 }});
-
+ 
 /* ── Chart: Top Types Horizontal Bar ─────────────────────────────────────── */
 const topTypes=Object.entries(DATA.type_counts).sort((a,b)=>b[1]-a[1]).slice(0,12);
 new Chart(document.getElementById('chartTypes'),{{
@@ -954,8 +1083,8 @@ new Chart(document.getElementById('chartTypes'),{{
     labels:topTypes.map(t=>t[0].replace(/_/g,' ')),
     datasets:[{{
       data:topTypes.map(t=>t[1]),
-      backgroundColor:'rgba(79,142,247,0.15)',
-      borderColor:'rgba(79,142,247,0.7)',
+      backgroundColor:'#4F8EF7',
+      borderColor:'#3A7AE0',
       borderWidth:1,borderRadius:4,borderSkipped:false
     }}]
   }},
@@ -969,34 +1098,50 @@ new Chart(document.getElementById('chartTypes'),{{
     animation:{{duration:500}}
   }}
 }});
-
+ 
 /* ── Render Exposures ────────────────────────────────────────────────────── */
 function renderExposures(){{
   const el=document.getElementById('exposures-content');
   const E=DATA.exposures;
   let html='';
-
+ 
   /* Cloud buckets */
   if(E.cloud_buckets.length){{
-    html+=`<div class="alert-banner alert-critical">
-      <div class="alert-icon">⚠</div>
-      <div class="alert-body"><strong>CRITICAL — Open Cloud Storage Buckets (${{E.cloud_buckets.length}})</strong>
-      <span>Publicly accessible buckets expose data without authentication. Immediate closure required.</span></div>
-    </div>`;
+    const critBuckets=E.cloud_buckets.filter(b=>b.severity==='CRITICAL');
+    const highBuckets=E.cloud_buckets.filter(b=>b.severity!=='CRITICAL');
+    if(critBuckets.length){{
+      html+=`<div class="alert-banner alert-critical">
+        <div class="alert-icon">⚠</div>
+        <div class="alert-body"><strong>CRITICAL — Sensitive Data in Open Buckets (${{critBuckets.length}})</strong>
+        <span>One or more publicly accessible buckets expose sensitive or confidential content. Immediate closure and review required.</span></div>
+      </div>`;
+    }}
+    if(highBuckets.length){{
+      html+=`<div class="alert-banner alert-high">
+        <div class="alert-icon">⬡</div>
+        <div class="alert-body"><strong>HIGH — Open Cloud Storage Buckets (${{highBuckets.length}})</strong>
+        <span>Publicly readable buckets with no confirmed sensitive content. Still a misconfiguration — restrict access and confirm contents.</span></div>
+      </div>`;
+    }}
     let rows='';
     E.cloud_buckets.forEach(b=>{{
       const prov=b.source.includes('amazonaws')?`<span class="chip prov-aws">AWS S3</span>`:
                  b.source.includes('googleapis')?`<span class="chip prov-gcp">GCS</span>`:
                  `<span class="chip prov-cloud">Cloud</span>`;
+      const reason=(b.matched&&b.matched.length)
+        ? b.matched.slice(0,6).map(m=>`<span class="chip" style="color:#FCA5A5;border-color:rgba(220,38,38,.35)">${{esc(m)}}</span>`).join(' ')
+        : `<span class="null-val">no sensitive indicators</span>`;
       rows+=`<tr>
+        <td>${{sev(b.severity)}}</td>
         <td>${{prov}}</td>
         <td><span class="url-val">${{esc(b.source)}}</span>${{copyBtn(b.source)}}</td>
         <td>${{esc(b.data)}}</td>
+        <td>${{reason}}</td>
       </tr>`;
     }});
-    html+=tbl(['Provider','Bucket Endpoint','Result'],rows);
+    html+=tbl(['Severity','Provider','Bucket Endpoint','Result','Sensitivity Match'],rows);
   }}
-
+ 
   /* Upload endpoints */
   if(E.url_uploads.length){{
     html+=`<div class="sec-hdr"><h2>File Upload Endpoints</h2><span class="count-pill">${{E.url_uploads.length}}</span></div>`;
@@ -1008,7 +1153,7 @@ function renderExposures(){{
     let rows=E.url_uploads.map(u=>`<tr><td><span class="url-val">${{esc(u)}}</span>${{copyBtn(u)}}</td></tr>`).join('');
     html+=tbl(['Upload URL'],rows);
   }}
-
+ 
   /* Interesting files */
   if(E.interesting_files.length){{
     html+=`<div class="sec-hdr"><h2>Publicly Accessible Sensitive Files</h2><span class="count-pill">${{E.interesting_files.length}}</span></div>`;
@@ -1026,25 +1171,30 @@ function renderExposures(){{
     }});
     html+=tbl(['Category','URL'],rows);
   }}
-
+ 
   /* TCP Ports */
   if(E.tcp_ports.length){{
+    const exempt=new Set((DATA.exempt_ports||[]).map(Number));
     html+=`<div class="sec-hdr"><h2>Open TCP Ports</h2><span class="count-pill">${{E.tcp_ports.length}}</span></div>`;
     let rows='';
     E.tcp_ports.forEach(p=>{{
       const parts=String(p.data).split(':');
       const port=parts[parts.length-1]||'';
+      const isExempt=exempt.has(Number(port));
       const banner=E.tcp_banners.find(b=>b.source===p.data);
       const bannerVal=banner?`<span class="mono-val" style="color:#8B9DB5">${{esc(banner.data.trim())}}</span>`:`<span class="null-val">—</span>`;
+      const portBadge=isExempt
+        ? `<span class="sev sev-INFO" style="font-family:var(--mono)">${{esc(port)||'—'}}</span> <span class="chip" style="margin-left:4px">exempt</span>`
+        : `<span class="sev sev-HIGH" style="font-family:var(--mono)">${{esc(port)||'—'}}</span>`;
       rows+=`<tr>
         <td><span class="mono-val">${{safeVal(p.source)}}</span></td>
-        <td><span class="sev sev-HIGH" style="font-family:var(--mono)">${{esc(port)||'—'}}</span></td>
+        <td>${{portBadge}}</td>
         <td>${{bannerVal}}</td>
       </tr>`;
     }});
     html+=tbl(['Host','Port','Service Banner'],rows);
   }}
-
+ 
   /* SSL mismatches */
   if(E.ssl_mismatches.length){{
     html+=`<div class="sec-hdr"><h2>SSL Certificate Mismatches</h2><span class="count-pill">${{E.ssl_mismatches.length}}</span></div>`;
@@ -1054,7 +1204,7 @@ function renderExposures(){{
     </tr>`).join('');
     html+=tbl(['Host','Mismatch Detail'],rows);
   }}
-
+ 
   /* Auth pages */
   if(E.url_passwords.length||E.url_passwords_historic.length){{
     const all=[...E.url_passwords,...E.url_passwords_historic];
@@ -1064,7 +1214,7 @@ function renderExposures(){{
     E.url_passwords_historic.forEach(u=>{{rows+=`<tr><td>${{sev('MEDIUM')}}<span style="margin-left:6px;font-size:10px;color:var(--text3)">ARCHIVED</span></td><td><span class="url-val">${{esc(u)}}</span>${{copyBtn(u)}}</td></tr>`;}});
     html+=tbl(['Status','URL'],rows);
   }}
-
+ 
   /* Similar domains */
   if(E.similar_domains.length){{
     html+=`<div class="sec-hdr"><h2>Lookalike / Similar Domains</h2><span class="count-pill">${{E.similar_domains.length}}</span></div>`;
@@ -1075,11 +1225,11 @@ function renderExposures(){{
     </tr>`).join('');
     html+=tbl(['Domain','Severity','Risk'],rows);
   }}
-
+ 
   el.innerHTML=html;
 }}
 renderExposures();
-
+ 
 /* ── Render F3EAD ────────────────────────────────────────────────────────── */
 function renderF3EAD(){{
   const phases=['FIND','FIX','FINISH','EXPLOIT','ANALYZE','DISSEMINATE'];
@@ -1092,7 +1242,7 @@ function renderF3EAD(){{
     ANALYZE:'Build human intelligence — names, usernames, social accounts.',
     DISSEMINATE:'Context for decisions — org structure, addresses, relationships.',
   }};
-
+ 
   /* Polar chart */
   new Chart(document.getElementById('chartF3EAD'),{{
     type:'polarArea',
@@ -1100,7 +1250,7 @@ function renderF3EAD(){{
       labels:phases,
       datasets:[{{
         data:phases.map(p=>DATA.f3ead_counts[p]||0),
-        backgroundColor:colors.map(c=>c+'28'),
+        backgroundColor:colors,
         borderColor:colors,borderWidth:1.5
       }}]
     }},
@@ -1115,7 +1265,7 @@ function renderF3EAD(){{
       animation:{{duration:600}}
     }}
   }});
-
+ 
   /* Radar chart */
   new Chart(document.getElementById('chartF3EADLine'),{{
     type:'radar',
@@ -1124,8 +1274,8 @@ function renderF3EAD(){{
       datasets:[{{
         label:'Findings',
         data:phases.map(p=>DATA.f3ead_counts[p]||0),
-        backgroundColor:'rgba(79,142,247,0.1)',
-        borderColor:'#4F8EF7',pointBackgroundColor:'#4F8EF7',
+        backgroundColor:'#4F8EF7',
+        borderColor:'#3A7AE0',pointBackgroundColor:'#4F8EF7',
         borderWidth:1.5,pointRadius:3,pointHoverRadius:5,
         tension:.2
       }}]
@@ -1142,7 +1292,7 @@ function renderF3EAD(){{
       animation:{{duration:600}}
     }}
   }});
-
+ 
   /* Phase cards */
   const grid=document.getElementById('f3ead-phases');
   phases.forEach((phase,i)=>{{
@@ -1169,7 +1319,7 @@ function renderF3EAD(){{
   }});
 }}
 renderF3EAD();
-
+ 
 /* ── Render JTC ──────────────────────────────────────────────────────────── */
 function renderJTC(){{
   const phases=Object.keys(DATA.jtc_counts);
@@ -1181,7 +1331,7 @@ function renderJTC(){{
     'Execution':'Intelligence that directly enables action — upload endpoints, auth pages, cloud buckets.',
     'Assessment':'Post-collection review — archived exposures, account enumeration, digital footprint scope.',
   }};
-
+ 
   /* Bar chart */
   new Chart(document.getElementById('chartJTC'),{{
     type:'bar',
@@ -1190,7 +1340,7 @@ function renderJTC(){{
       datasets:[{{
         label:'Findings',
         data:phases.map(p=>DATA.jtc_counts[p]||0),
-        backgroundColor:colors.map(c=>c+'22'),
+        backgroundColor:colors,
         borderColor:colors,borderWidth:1.5,
         borderRadius:6,borderSkipped:false
       }}]
@@ -1205,7 +1355,7 @@ function renderJTC(){{
       animation:{{duration:500}}
     }}
   }});
-
+ 
   /* Pipeline strip */
   const pipeline=document.getElementById('jtc-pipeline');
   phases.forEach((phase,i)=>{{
@@ -1214,7 +1364,7 @@ function renderJTC(){{
       <div class="jtc-stage-count" style="color:${{colors[i]}}">${{DATA.jtc_counts[phase]||0}}</div>
     </div>`;
   }});
-
+ 
   /* Phase breakdown tables */
   const el=document.getElementById('jtc-phases');
   phases.forEach((phase,i)=>{{
@@ -1244,12 +1394,12 @@ function renderJTC(){{
   }});
 }}
 renderJTC();
-
+ 
 /* ── Render MITRE ────────────────────────────────────────────────────────── */
 function renderMitre(){{
   const tactics=Object.keys(DATA.tactic_counts).sort();
   const tPalette=['#4F8EF7','#7C6AF7','#059669','#D97706','#DC2626','#0891B2','#C061C2','#9CA3AF'];
-
+ 
   new Chart(document.getElementById('chartTactics'),{{
     type:'bar',
     data:{{
@@ -1257,7 +1407,7 @@ function renderMitre(){{
       datasets:[{{
         label:'Findings',
         data:tactics.map(t=>DATA.tactic_counts[t]||0),
-        backgroundColor:tPalette.map(c=>c+'22'),
+        backgroundColor:tPalette,
         borderColor:tPalette,borderWidth:1.5,
         borderRadius:6,borderSkipped:false
       }}]
@@ -1272,7 +1422,7 @@ function renderMitre(){{
       animation:{{duration:500}}
     }}
   }});
-
+ 
   const tbody=document.getElementById('mitre-tbody');
   DATA.findings.forEach(f=>{{
     const tr=document.createElement('tr');
@@ -1288,26 +1438,26 @@ function renderMitre(){{
   }});
 }}
 renderMitre();
-
+ 
 function filterMitreTable(){{
   const q=document.getElementById('mitre-search').value.toLowerCase();
   document.querySelectorAll('#mitre-tbody tr').forEach(tr=>{{
     tr.style.display=tr.dataset.search.includes(q)?'':'none';
   }});
 }}
-
+ 
 /* ── Render Identity ─────────────────────────────────────────────────────── */
 function renderIdentity(){{
   const el=document.getElementById('identity-content');
   const E=DATA.exposures;
   let html='';
-
+ 
   html+=`<div class="alert-banner alert-high">
     <div class="alert-icon">◎</div>
     <div class="alert-body"><strong>HIGH — Personnel Enumeration Confirmed</strong>
     <span>Identified names and usernames enable spear-phishing, credential stuffing, and social engineering.</span></div>
   </div>`;
-
+ 
   /* Names + Usernames grid */
   html+=`<div class="two-col">`;
   html+=`<div>
@@ -1319,7 +1469,7 @@ function renderIdentity(){{
     <div class="name-grid">${{E.usernames.map(u=>`<div class="name-chip mono-chip">${{esc(u)}}</div>`).join('')}}</div>
   </div>`;
   html+=`</div>`;
-
+ 
   /* External accounts */
   if(E.accounts_external.length){{
     html+=`<div class="sec-hdr"><h2>External Platform Accounts</h2><span class="count-pill">${{E.accounts_external.length}}</span></div>`;
@@ -1335,21 +1485,21 @@ function renderIdentity(){{
     }});
     html+=tbl(['Platform / Category','Profile URL'],rows);
   }}
-
+ 
   /* Emails */
   if(E.emails.length){{
     html+=`<div class="sec-hdr"><h2>Email Addresses</h2><span class="count-pill">${{E.emails.length}}</span></div>`;
     let rows=E.emails.map(e=>`<tr><td><span class="mono-val">${{esc(e)}}</span>${{copyBtn(e)}}</td></tr>`).join('');
     html+=tbl(['Email Address'],rows);
   }}
-
+ 
   /* Social media */
   if(E.social_media.length){{
     html+=`<div class="sec-hdr"><h2>Social Media Links</h2><span class="count-pill">${{E.social_media.length}}</span></div>`;
     let rows=E.social_media.map(s=>`<tr><td><span class="url-val">${{esc(s)}}</span>${{copyBtn(s)}}</td></tr>`).join('');
     html+=tbl(['URL'],rows);
   }}
-
+ 
   /* PGP Keys */
   if(E.pgp_keys.length){{
     html+=`<div class="sec-hdr"><h2>PGP Keys</h2><span class="count-pill">${{E.pgp_keys.length}}</span></div>`;
@@ -1365,21 +1515,21 @@ function renderIdentity(){{
       </div>`;
     }});
   }}
-
+ 
   el.innerHTML=html;
 }}
 renderIdentity();
-
+ 
 /* ── Render Infrastructure ───────────────────────────────────────────────── */
 function renderInfra(){{
   const el=document.getElementById('infra-content');
   const E=DATA.exposures;
   let html='';
-
+ 
   /* Subdomains chip grid */
   html+=`<div class="sec-hdr"><h2>Subdomains / Internet Names</h2><span class="count-pill">${{E.subdomains.length}}</span></div>`;
   html+=`<div class="host-grid">${{E.subdomains.map(s=>`<div class="host-chip" title="${{esc(s)}}">${{esc(s)}}</div>`).join('')}}</div>`;
-
+ 
   /* IPs */
   html+=`<div class="sec-hdr"><h2>IP Addresses</h2><span class="count-pill">${{E.ip_addresses.length}}</span></div>`;
   let ipRows=E.ip_addresses.map(r=>`<tr>
@@ -1387,45 +1537,61 @@ function renderInfra(){{
     <td><span class="mono-val" style="color:#7EB3FF;font-weight:600">${{safeVal(r.data)}}</span>${{copyBtn(r.data||'')}}</td>
   </tr>`).join('');
   html+=tbl(['Source Hostname','IP Address'],ipRows);
-
+ 
   /* Technologies */
   if(E.technologies.length){{
     html+=`<div class="sec-hdr"><h2>Technologies Detected</h2><span class="count-pill">${{E.technologies.length}}</span></div>`;
     let rows=E.technologies.map(t=>`<tr><td><span class="chip">${{esc(t)}}</span></td></tr>`).join('');
     html+=tbl(['Technology / Framework'],rows);
   }}
-
+ 
   /* Banners */
   if(E.banners.length){{
     html+=`<div class="sec-hdr"><h2>Server Banners</h2><span class="count-pill">${{E.banners.length}}</span></div>`;
     let rows=[...new Set(E.banners)].map(b=>`<tr><td><span class="mono-val" style="color:#8B9DB5">${{esc(b)}}</span></td></tr>`).join('');
     html+=tbl(['Banner String'],rows);
   }}
-
+ 
   /* Code repos */
   if(E.code_repos.length){{
     html+=`<div class="sec-hdr"><h2>Public Code Repositories</h2><span class="count-pill">${{E.code_repos.length}}</span></div>`;
     let rows=E.code_repos.map(r=>{{
-      const val=Array.isArray(r)?r[1]||r[0]:r;
-      return`<tr><td><span class="url-val">${{esc(val)}}</span>${{copyBtn(String(val))}}</td></tr>`;
+      const raw=Array.isArray(r)?(r[1]||r[0]):r;
+      // Parse SpiderFoot's "Name: ...\nURL: ...\nDescription: ..." structure
+      const text=String(raw);
+      const nameM=text.match(/Name:\s*(.*)/i);
+      const urlM=text.match(/URL:\s*(\S+)/i);
+      const descM=text.match(/Description:\s*([\s\S]*)/i);
+      const name=nameM?nameM[1].trim():'';
+      const url=urlM?urlM[1].trim():(text.startsWith('http')?text.trim():'');
+      const desc=descM?descM[1].trim():'';
+      const urlCell=url
+        ? `<a class="url-val repo-url" href="${{esc(url)}}" target="_blank" rel="noopener">${{esc(url)}}</a>`
+        : `<span class="url-val repo-url">${{esc(text)}}</span>`;
+      return`<tr>
+        <td>${{name?`<span class="mono-val">${{esc(name)}}</span>`:`<span class="null-val">—</span>`}}</td>
+        <td class="repo-url-cell">${{urlCell}}</td>
+        <td>${{desc?`<span style="color:var(--text2);font-size:12px">${{esc(desc)}}</span>`:`<span class="null-val">—</span>`}}</td>
+        <td class="copy-cell">${{copyBtn(url||text)}}</td>
+      </tr>`;
     }}).join('');
-    html+=tbl(['Repository'],rows);
+    html+=tbl(['Name','Repository URL','Description','&nbsp;'],rows);
   }}
-
+ 
   /* Physical addresses */
   if(E.physical_addresses.length){{
     html+=`<div class="sec-hdr"><h2>Physical Addresses</h2><span class="count-pill">${{E.physical_addresses.length}}</span></div>`;
     let rows=E.physical_addresses.map(a=>`<tr><td>${{esc(a)}}</td></tr>`).join('');
     html+=tbl(['Address'],rows);
   }}
-
+ 
   el.innerHTML=html;
 }}
 renderInfra();
 </script>
 </body>
 </html>"""
-
+ 
 def generate_report(csv_path, output_path):
     print(f"[*] Loading: {csv_path}")
     df = load_data(csv_path)
@@ -1443,7 +1609,7 @@ def generate_report(csv_path, output_path):
     print(f"    Records:  {payload['total_findings']}")
     print(f"    CRITICAL: {payload['severity'].get('CRITICAL',0)}")
     print(f"    HIGH:     {payload['severity'].get('HIGH',0)}")
-
+ 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python3 generate_spiderfoot_report_v2.py <input.csv> [output.html]")
